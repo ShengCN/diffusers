@@ -20,6 +20,8 @@ import os
 import random
 import shutil
 from pathlib import Path
+
+import torch.nn as nn
 from SSN_Dataset import SSN_Dataset
 
 import accelerate
@@ -39,6 +41,9 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
+import numpy as np
+import matplotlib.pyplot as plt
+
 import diffusers
 from diffusers import (
     AutoencoderKL,
@@ -49,7 +54,7 @@ from diffusers import (
     UniPCMultistepScheduler,
 )
 from diffusers.optimization import get_scheduler
-from diffusers.utils import check_min_version, is_wandb_available
+from diffusers.utils import check_min_version, is_wandb_available, make_image_grid
 from diffusers.utils.import_utils import is_xformers_available
 
 
@@ -71,6 +76,102 @@ def image_grid(imgs, rows, cols):
     for i, img in enumerate(imgs):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
+
+def zero_module(module):
+    for p in module.parameters():
+        nn.init.zeros_(p)
+    return module
+
+
+def log_training(vae, text_encoder, tokenizer, unet, controlnet, dataloader, args, accelerator, weight_dtype, step):
+    logger.info("Running training plotting... ")
+
+    controlnet = accelerator.unwrap_model(controlnet)
+
+    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        unet=unet,
+        controlnet=controlnet,
+        safety_checker=None,
+        revision=args.revision,
+        torch_dtype=weight_dtype,
+    )
+
+    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    if args.enable_xformers_memory_efficient_attention:
+        pipeline.enable_xformers_memory_efficient_attention()
+
+    if args.seed is None:
+        generator = None
+    else:
+        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+
+    image_logs = []
+    # get validation_prompts and validation images
+    for i, batch in enumerate(dataloader):
+        # Let's plot the first four data 
+        if i > 2: 
+            break
+
+        targets = batch["pixel_values"]
+        prompts = batch['prompts']
+        conditions = batch['conditioning_pixel_values']
+
+        preds = pipeline(prompts, conditions, num_inference_steps=20, generator=generator)
+        preds = np.concatenate([np.asarray(pred)[None, ...] for pred in preds.images], axis=0)
+        targets = targets.detach().cpu().numpy().transpose(0, 2, 3, 1)
+        conditions = conditions.detach().cpu().numpy().transpose(0, 2, 3, 1)
+
+        image_logs.append(
+            {"inputs": conditions, 
+             "preds": preds, 
+             "prompts": prompts,
+             "targets": targets}
+        )
+
+    for tracker in accelerator.trackers:
+        if tracker.name == "tensorboard":
+            for log in image_logs:
+                conditions  = log['inputs']             # conditions, pytorch tensor 
+                prompts = log["prompts"]                # prompts 
+                targets = log["targets"]                # targets, pytorch tensor
+                preds = log["preds"]                    # predictions, PIL image 
+
+                # formatted_images = []
+                # formatted_images.append(np.asarray(validation_image))
+                # for image in images:
+                #     formatted_images.append(np.asarray(image))
+                # formatted_images = np.stack(formatted_images)
+                # import pdb; pdb.set_trace()
+                tracker.writer.add_images(f'train/mask', conditions, step, dataformats="NHWC")
+                tracker.writer.add_images(f'train/pred', preds, step, dataformats="NHWC")
+                tracker.writer.add_images(f'train/target', targets, step, dataformats="NHWC")
+
+        elif tracker.name == "wandb":
+            formatted_images = []
+
+            for log in image_logs:
+                images = log["images"]
+                validation_prompt = log["validation_prompt"]
+                validation_image = log["validation_image"]
+
+                formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
+
+                for image in images:
+                    image = wandb.Image(image, caption=validation_prompt)
+                    formatted_images.append(image)
+
+            tracker.log({"validation": formatted_images})
+        else:
+            logger.warn(f"image logging not implemented for {tracker.name}")
+
+        return image_logs
 
 
 def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step):
@@ -116,9 +217,11 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
         )
 
     image_logs = []
-
+    
+    # import pdb; pdb.set_trace() 
     for validation_prompt, validation_image in zip(validation_prompts, validation_images):
-        validation_image = Image.open(validation_image).convert("RGB")
+        # validation_image = Image.open(validation_image).convert("RGB")
+        validation_image = Image.fromarray((np.repeat(plt.imread(validation_image)[..., :1], 3, axis=2) * 255.0).astype(np.uint8))
 
         images = []
 
@@ -521,9 +624,17 @@ def parse_args(input_args=None):
         help="Number of images to be generated for each `--validation_image`, `--validation_prompt` pair",
     )
     parser.add_argument(
+        "--training_steps",
+        type=int,
+        default=500,
+        help=(
+            "Run training logging every X steps. "
+        ),
+    )
+    parser.add_argument(
         "--validation_steps",
         type=int,
-        default=100,
+        default=500,
         help=(
             "Run validation every X steps. Validation consists of running the prompt"
             " `args.validation_prompt` multiple times: `args.num_validation_images`"
@@ -539,6 +650,16 @@ def parse_args(input_args=None):
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+
+    parser.add_argument(
+        "--ibl_embedding",
+        type=str,
+        default="Text",
+        help=(
+            'Text' or 'Time'
+        ),
+    )
+
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -602,7 +723,6 @@ def make_train_dataset(args, tokenizer, accelerator):
                           )
 
     with accelerator.main_process_first():
-        import pdb; pdb.set_trace()
         train_dataset = dataset
 
     return train_dataset
@@ -616,11 +736,16 @@ def collate_fn(examples):
     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
 
     input_ids = torch.stack([example["input_ids"] for example in examples])
+    ibl = torch.stack([example["ibl"] for example in examples])
+
+    prompts = [example['prompts'] for example in examples]
 
     return {
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "input_ids": input_ids,
+        "prompts": prompts, 
+        "ibl": ibl
     }
 
 
@@ -726,6 +851,16 @@ def main(args):
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
+
+    # we can define our time embedding here
+    if 'Time' in args.ibl_embedding:
+        #LL-time_embedding
+        ibl_features = 8 * 32 # 8 x 32 dims
+        in_channels = unet.time_embedding.linear_1.in_features
+
+        # TODO, zero initialization 
+        unet.time_embedding.cond_proj = zero_module(nn.Linear(ibl_features, in_channels, bias=False))
+
     vae.requires_grad_(False)
     unet.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -792,7 +927,6 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    #FLY-Dataset creatation
     train_dataset = make_train_dataset(args, tokenizer, accelerator)
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -941,15 +1075,29 @@ def main(args):
                 )
 
                 # Predict the noise residual
-                model_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    down_block_additional_residuals=[
-                        sample.to(dtype=weight_dtype) for sample in down_block_res_samples
-                    ],
-                    mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
-                ).sample
+                #LL-time-embedding
+                if 'Time' in args.ibl_embedding:
+                    ibl_cond = batch["ibl"].to(dtype=weight_dtype)
+                    model_pred = unet(
+                        noisy_latents,
+                        timesteps,
+                        timestep_cond=ibl_cond,
+                        encoder_hidden_states=encoder_hidden_states,
+                        down_block_additional_residuals=[
+                            sample.to(dtype=weight_dtype) for sample in down_block_res_samples
+                        ],
+                        mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
+                    ).sample
+                else:
+                    model_pred = unet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=encoder_hidden_states,
+                        down_block_additional_residuals=[
+                            sample.to(dtype=weight_dtype) for sample in down_block_res_samples
+                        ],
+                        mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
+                    ).sample
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -958,8 +1106,8 @@ def main(args):
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = controlnet.parameters()
@@ -967,6 +1115,9 @@ def main(args):
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
+
+
+
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -998,6 +1149,23 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+
+                    # we also need to plot the training results 
+                    if global_step % args.training_steps == 0: 
+                        image_logs = log_training(
+                            vae,
+                            text_encoder,
+                            tokenizer,
+                            unet,
+                            controlnet,
+                            train_dataloader,
+                            args,
+                            accelerator,
+                            weight_dtype,
+                            global_step,
+                        )
+
+
 
                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
                         image_logs = log_validation(
